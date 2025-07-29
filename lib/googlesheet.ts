@@ -1,10 +1,6 @@
-import { google } from 'googleapis';
-import { JWT } from 'google-auth-library';
+import { MongoClient, Db, Collection } from 'mongodb';
 
-const SPREADSHEET_ID = //'1JQOP0BInND1IVZZv29IkYmjJfl_Zl5LW68R57DS2iAg';
-'1KBRpNf2Qlv9twVa5mqR-7lfZS2fjM_8D60sOYwFpDjA';
-
-const categories = [
+export const categories = [
   'drives',
   'blog',
   'gallery',
@@ -17,28 +13,33 @@ const categories = [
   'donations',
 ];
 
-// Vercel-compatible Google Auth setup
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    type: 'service_account',
-    project_id: process.env.GOOGLE_PROJECT_ID,
-    private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-    private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    client_id: process.env.GOOGLE_CLIENT_ID,
-  },
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
 
-async function getSheetsClient() {
-  try {
-    const authClient = await auth.getClient() as JWT;
-    const sheets = google.sheets({ version: 'v4', auth: authClient });
-    return sheets;
-  } catch (error) {
-    console.error('Failed to create sheets client:', error);
-    throw error;
-  }
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) throw new Error('Missing env var:  MONGODB_URI');
+
+const DB_NAME = process.env.MONGODB_DB || 'app';
+
+let clientPromise: Promise<MongoClient>;
+
+declare global {
+  var _mongoClientPromise: Promise<MongoClient> | undefined;
 }
 
-export { getSheetsClient, SPREADSHEET_ID, categories };
+if (!global._mongoClientPromise) {
+  global._mongoClientPromise = new MongoClient(MONGODB_URI).connect();
+}
+clientPromise = global._mongoClientPromise;
+
+export async function getDb(): Promise<Db> {
+  const client = await clientPromise;
+  return client.db(DB_NAME);
+}
+
+export async function getCollection<T extends Document = any>(
+  name: string,
+): Promise<Collection<T>> {
+  const db = await getDb();
+  return db.collection<T>(name);
+}
+
+export { clientPromise as getMongoClient };

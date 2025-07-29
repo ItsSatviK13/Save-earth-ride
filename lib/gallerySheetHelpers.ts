@@ -1,8 +1,8 @@
-import { getSheetsClient, SPREADSHEET_ID } from './googlesheet';
 
-const GALLERY_SHEET_NAME = 'gallery';
+import clientPromise from './mongo';              
+import { Collection } from 'mongodb';
 
-interface GalleryItem {
+export interface GalleryItem {
   id: number;
   image: string;
   title: string;
@@ -15,227 +15,100 @@ interface GalleryItem {
   updatedAt?: string;
 }
 
+const COLLECTION_NAME = 'gallery';                         
+const DB_NAME         = process.env.MONGODB_DB || 'app';   
+const CACHE_TTL       = 5 * 60_000;                        
+
+interface CacheEntry {
+  data: GalleryItem[];
+  timestamp: number;
+}
+
+let cache: CacheEntry | null = null;
+let initialized = false;
+
+async function getCollection(): Promise<Collection<GalleryItem>> {
+  const client = await clientPromise;
+  const col = client.db(DB_NAME).collection<GalleryItem>(COLLECTION_NAME);
+
+  if (!initialized) {
+    await col.createIndex({ id: 1 }, { unique: true });
+    initialized = true;
+  }
+  return col;
+}
+
 export async function getGalleryData(): Promise<GalleryItem[]> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${GALLERY_SHEET_NAME}!A2:J`, // Assuming headers are in row 1
-    });
+  const now = Date.now();
+  if (cache && now - cache.timestamp < CACHE_TTL) return cache.data;
 
-    const rows = response.data.values || [];
-    
-    return rows.map((row: any[], index: number) => ({
-      id: parseInt(row[0]) || index + 1,
-      image: row[1] || '',
-      title: row[2] || '',
-      location: row[3] || '',
-      city: row[4] || '',
-      year: row[5] || '',
-      tags: row[6] ? row[6].split(',').map((tag: string) => tag.trim()) : [],
-      description: row[7] || '',
-      createdAt: row[8] || '',
-      updatedAt: row[9] || ''
-    }));
-  } catch (error) {
-    console.error('Error fetching gallery data:', error);
-    
-    // Create sheet if it doesn't exist
-    const errorMsg = typeof error==='string' ? error : (error instanceof Error ? error.message : String(error));
-    if (errorMsg.toString().includes('Unable to parse range')) {
-      await createGallerySheet();
-      return [];
-    }
-    
-    throw error;
-  }
+  const col   = await getCollection();
+  const docs  = await col.find({}).toArray();
+  const items = docs.map(({ _id, ...rest }) => rest as GalleryItem);
+
+  cache = { data: items, timestamp: now };
+  return items;
 }
 
-export async function appendToGallerySheet(item: Omit<GalleryItem, 'id' | 'createdAt' | 'updatedAt'>): Promise<GalleryItem> {
-  try {
-    const sheets = await getSheetsClient();
-    const timestamp = new Date().toISOString();
-    const id = Date.now();
-    
-    const tagsString = Array.isArray(item.tags) ? item.tags.join(', ') : item.tags;
-    
-    const values = [
-      [
-        id,
-        item.image,
-        item.title,
-        item.location,
-        item.city,
-        item.year,
-        tagsString,
-        item.description,
-        timestamp,
-        timestamp
-      ]
-    ];
+export async function appendToGallerySheet(
+  item: Omit<GalleryItem, 'id' | 'createdAt' | 'updatedAt'>,
+): Promise<GalleryItem> {
+  const nowIso = new Date().toISOString();
+  const newDoc: GalleryItem = {
+    id: Date.now(),
+    ...item,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
 
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${GALLERY_SHEET_NAME}!A:J`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values,
-      },
-    });
+  const col = await getCollection();
+  await col.insertOne({ ...newDoc });
 
-    return {
-      id,
-      ...item,
-      createdAt: timestamp,
-      updatedAt: timestamp
-    };
-  } catch (error) {
-    console.error('Error appending to gallery sheet:', error);
-    throw error;
+  if (cache) {
+    cache.data.push(newDoc);
+    cache.timestamp = Date.now();
   }
+  return newDoc;
 }
 
-export async function updateGallerySheet(item: GalleryItem): Promise<GalleryItem> {
-  try {
-    const sheets = await getSheetsClient();
-    const timestamp = new Date().toISOString();
-    
-    // Find the row with the matching ID
-    const allData = await getGalleryData();
-    const rowIndex = allData.findIndex(row => row.id === item.id);
-    
-    if (rowIndex === -1) {
-      throw new Error('Item not found');
-    }
+export async function updateGallerySheet(
+  item: GalleryItem,
+): Promise<GalleryItem> {
+  const col       = await getCollection();
+  const updatedAt = new Date().toISOString();
 
-    const tagsString = Array.isArray(item.tags) ? item.tags.join(', ') : item.tags;
-    
-    const values = [
-      [
-        item.id,
-        item.image,
-        item.title,
-        item.location,
-        item.city,
-        item.year,
-        tagsString,
-        item.description,
-        item.createdAt || timestamp,
-        timestamp
-      ]
-    ];
+  const doc = await col.findOneAndUpdate(
+    { id: item.id },
+    { $set: { ...item, updatedAt } },
+    { returnDocument: 'after' },            
+  );
 
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${GALLERY_SHEET_NAME}!A${rowIndex + 2}:J${rowIndex + 2}`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values,
-      },
-    });
+  if (!doc) throw new Error('Item not found');
+  const { _id, ...updatedItem } = doc as any;
 
-    return {
-      ...item,
-      updatedAt: timestamp
-    };
-  } catch (error) {
-    console.error('Error updating gallery sheet:', error);
-    throw error;
+  if (cache) {
+    const idx = cache.data.findIndex((d) => d.id === item.id);
+    if (idx !== -1) cache.data[idx] = updatedItem as GalleryItem;
+    cache.timestamp = Date.now();
   }
+  return updatedItem as GalleryItem;
 }
 
 export async function deleteFromGallerySheet(id: number): Promise<void> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Find the row with the matching ID
-    const allData = await getGalleryData();
-    const rowIndex = allData.findIndex(row => row.id === id);
-    
-    if (rowIndex === -1) {
-      throw new Error('Item not found');
-    }
+  const col = await getCollection();
+  const res = await col.deleteOne({ id });
+  if (res.deletedCount === 0) throw new Error('Item not found');
 
-    // Delete the row
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: {
-        requests: [
-          {
-            deleteDimension: {
-              range: {
-                sheetId: await getSheetId(GALLERY_SHEET_NAME),
-                dimension: 'ROWS',
-                startIndex: rowIndex + 1, // +1 because of header row
-                endIndex: rowIndex + 2,
-              },
-            },
-          },
-        ],
-      },
-    });
-  } catch (error) {
-    console.error('Error deleting from gallery sheet:', error);
-    throw error;
+  if (cache) {
+    const idx = cache.data.findIndex((d) => d.id === id);
+    if (idx !== -1) cache.data.splice(idx, 1);
+    cache.timestamp = Date.now();
   }
 }
 
 async function createGallerySheet(): Promise<void> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Create the sheet
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: {
-        requests: [
-          {
-            addSheet: {
-              properties: {
-                title: GALLERY_SHEET_NAME,
-              },
-            },
-          },
-        ],
-      },
-    });
-
-    // Add headers
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${GALLERY_SHEET_NAME}!A1:J1`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [
-          [
-            'ID',
-            'Image',
-            'Title',
-            'Location',
-            'City',
-            'Year',
-            'Tags',
-            'Description',
-            'Created At',
-            'Updated At'
-          ]
-        ],
-      },
-    });
-  } catch (error) {
-    console.error('Error creating gallery sheet:', error);
-    throw error;
-  }
 }
 
-async function getSheetId(sheetName: string): Promise<number> {
-  const sheets = await getSheetsClient();
-  
-  const response = await sheets.spreadsheets.get({
-    spreadsheetId: SPREADSHEET_ID,
-  });
-
-  const sheet = response.data.sheets?.find(s => s.properties?.title === sheetName);
-  return sheet?.properties?.sheetId || 0;
+async function getSheetId(_sheetName: string): Promise<number> {
+  return 0;
 }

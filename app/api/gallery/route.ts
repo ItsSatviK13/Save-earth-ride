@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSheetsClient, SPREADSHEET_ID } from '@/lib/googlesheet';
 import { appendToGallerySheet, updateGallerySheet, deleteFromGallerySheet, getGalleryData } from '@/lib/gallerySheetHelpers';
 
 export async function GET() {

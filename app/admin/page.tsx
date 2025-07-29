@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -12,8 +12,8 @@ import { toast } from 'sonner';
  * Admin Authentication System
  * 
  * This component handles admin login with role-based access control.
- * It validates credentials against the admin database and redirects
- * users based on their role permissions.
+ * It validates credentials against the admin API and manages sessions
+ * with automatic timeout after 3 minutes of inactivity.
  * 
  * Roles:
  * - Super Admin: Full access to all features and data
@@ -22,62 +22,178 @@ import { toast } from 'sonner';
  * - Editor: Read-only access with content editing permissions
  */
 
-/**
- * Admin Credentials Loader
- * 
- * Loads admin credentials from localStorage (admin-managed data).
- * In production, this would be replaced with secure API authentication.
- */
-const getAdminCredentials = () => {
-  if (typeof window !== 'undefined') {
-    try {
-      const saved = localStorage.getItem('adminData');
-      if (saved) {
-        const admins = JSON.parse(saved);
-        return admins.filter((admin: any) => admin.status === 'active');
-      }
-    } catch (error) {
-      console.error('Error loading admin credentials:', error);
-    }
-  }
-  
-  // Default admin credentials if localStorage is empty
-  return [
-    {
-      id: 1,
-      username: 'admin',
-      email: 'admin@saveearthride.com',
-      password: 'saveearthride2024',
-      role: 'Super Admin',
-      status: 'active'
-    },
-    {
-      id: 2,
-      username: 'manager',
-      email: 'manager@saveearthride.com',
-      password: 'manager123',
-      role: 'Manager',
-      status: 'active'
-    }
-  ];
-};
+interface Admin {
+  id: number;
+  username: string;
+  email: string;
+  password: string;
+  role: string;
+  createdAt?: string;
+  lastLogin?: string;
+  status?: string;
+}
+
+interface AdminSession {
+  id: number;
+  username: string;
+  email: string;
+  role: string;
+  loginTime: string;
+  lastActivity: string;
+  permissions: RolePermissions;
+}
+
+interface RolePermissions {
+  canManageAdmins: boolean;
+  canManageAllData: boolean;
+  canDeleteData: boolean;
+  canExportData: boolean;
+  canViewAnalytics: boolean;
+  canManageSettings: boolean;
+}
+
+const SESSION_TIMEOUT = 3 * 60 * 1000; // 3 minutes in milliseconds
 
 export default function AdminPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [isLoading, setIsLoading] = useState(false);
   const [loginAttempts, setLoginAttempts] = useState(0);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [currentSession, setCurrentSession] = useState<AdminSession | null>(null);
+
+  /**
+   * Session Management
+   * 
+   * Checks for existing session and validates timeout
+   */
+  useEffect(() => {
+    checkExistingSession();
+    
+    // Set up session timeout checker
+    const sessionChecker = setInterval(() => {
+      checkSessionTimeout();
+    }, 30000); // Check every 30 seconds
+
+    // Update last activity on user interaction
+    const updateActivity = () => updateLastActivity();
+    
+    document.addEventListener('mousedown', updateActivity);
+    document.addEventListener('keydown', updateActivity);
+    document.addEventListener('scroll', updateActivity);
+    document.addEventListener('touchstart', updateActivity);
+
+    return () => {
+      clearInterval(sessionChecker);
+      document.removeEventListener('mousedown', updateActivity);
+      document.removeEventListener('keydown', updateActivity);
+      document.removeEventListener('scroll', updateActivity);
+      document.removeEventListener('touchstart', updateActivity);
+    };
+  }, []);
+
+  /**
+   * Check for existing valid session
+   */
+  const checkExistingSession = () => {
+    if (typeof window !== 'undefined') {
+      try {
+        const sessionData = localStorage.getItem('adminSession');
+        if (sessionData) {
+          const session: AdminSession = JSON.parse(sessionData);
+          const now = Date.now();
+          const lastActivity = new Date(session.lastActivity).getTime();
+          
+          if (now - lastActivity < SESSION_TIMEOUT) {
+            setCurrentSession(session);
+            setIsAuthenticated(true);
+            updateLastActivity();
+            // Redirect to dashboard if already authenticated
+            setTimeout(() => {
+              window.location.href = '/admin/dashboard';
+            }, 1000);
+          } else {
+            // Session expired
+            handleLogout(false);
+          }
+        }
+      } catch (error) {
+        console.error('Error checking session:', error);
+        handleLogout(false);
+      }
+    }
+  };
+
+  /**
+   * Check if session has timed out
+   */
+  const checkSessionTimeout = () => {
+    if (currentSession && typeof window !== 'undefined') {
+      const sessionData = localStorage.getItem('adminSession');
+      if (sessionData) {
+        try {
+          const session: AdminSession = JSON.parse(sessionData);
+          const now = Date.now();
+          const lastActivity = new Date(session.lastActivity).getTime();
+          
+          if (now - lastActivity >= SESSION_TIMEOUT) {
+            toast.error('Session expired due to inactivity');
+            handleLogout(false);
+          }
+        } catch (error) {
+          console.error('Error checking session timeout:', error);
+          handleLogout(false);
+        }
+      }
+    }
+  };
+
+  /**
+   * Update last activity timestamp
+   */
+  const updateLastActivity = () => {
+    if (typeof window !== 'undefined' && currentSession) {
+      try {
+        const updatedSession = {
+          ...currentSession,
+          lastActivity: new Date().toISOString()
+        };
+        localStorage.setItem('adminSession', JSON.stringify(updatedSession));
+        setCurrentSession(updatedSession);
+      } catch (error) {
+        console.error('Error updating activity:', error);
+      }
+    }
+  };
+
+  /**
+   * Fetch admin data from API
+   */
+  const fetchAdminData = async (): Promise<Admin[]> => {
+    try {
+      const response = await fetch('/api/admins', {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`API Error: ${response.status}`);
+      }
+
+      const result = await response.json();
+      return result.data || [];
+    } catch (error) {
+      console.error('Error fetching admin data:', error);
+      throw new Error('Failed to fetch admin data from API');
+    }
+  };
 
   /**
    * Authentication Handler
    * 
-   * Validates user credentials against the admin database.
+   * Validates user credentials against the admin API.
    * Implements security features like attempt limiting and role-based access.
-   * 
-   * Security Features:
-   * - Login attempt limiting (max 5 attempts)
-   * - Input validation and sanitization
-   * - Role-based redirection
-   * - Session management preparation
    */
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,36 +213,52 @@ export default function AdminPage() {
     setIsLoading(true);
 
     try {
-      // Load admin credentials
-      const adminCredentials = getAdminCredentials();
+      // Fetch admin data from API
+      const adminCredentials = await fetchAdminData();
       
       // Find matching admin
-      const admin = adminCredentials.find((a: any) => 
+      const admin = adminCredentials.find((a: Admin) => 
         a.username.toLowerCase() === loginForm.username.toLowerCase() && 
         a.password === loginForm.password &&
-        a.status === 'active'
+        (a.status === 'active' || !a.status) // Handle undefined status as active
       );
 
       if (admin) {
-        // Store admin session data
-        const sessionData = {
+        // Create session data
+        const sessionData: AdminSession = {
           id: admin.id,
           username: admin.username,
           email: admin.email,
           role: admin.role,
           loginTime: new Date().toISOString(),
+          lastActivity: new Date().toISOString(),
           permissions: getRolePermissions(admin.role)
         };
         
+        // Store session
         localStorage.setItem('adminSession', JSON.stringify(sessionData));
+        setCurrentSession(sessionData);
+        setIsAuthenticated(true);
         
-        // Update last login time
-        const updatedAdmins = adminCredentials.map((a: any) => 
-          a.id === admin.id 
-            ? { ...a, lastLogin: new Date().toLocaleDateString() }
-            : a
-        );
-        localStorage.setItem('adminData', JSON.stringify(updatedAdmins));
+        // Update admin's last login in API
+        try {
+          const updatedAdmins = adminCredentials.map((a: Admin) => 
+            a.id === admin.id 
+              ? { ...a, lastLogin: new Date().toLocaleDateString() }
+              : a
+          );
+          
+          await fetch('/api/admins', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(updatedAdmins),
+          });
+        } catch (updateError) {
+          console.error('Error updating last login:', updateError);
+          // Don't fail login if update fails
+        }
         
         toast.success(`Welcome back, ${admin.username}! (${admin.role})`);
         
@@ -143,7 +275,7 @@ export default function AdminPage() {
       }
     } catch (error) {
       console.error('Login error:', error);
-      toast.error('Login failed. Please try again.');
+      toast.error('Login failed. Unable to connect to authentication service.');
     } finally {
       setIsLoading(false);
     }
@@ -153,9 +285,8 @@ export default function AdminPage() {
    * Role Permissions System
    * 
    * Defines what each role can access and modify.
-   * This system ensures proper access control throughout the admin panel.
    */
-  const getRolePermissions = (role: string) => {
+  const getRolePermissions = (role: string): RolePermissions => {
     switch (role) {
       case 'Super Admin':
         return {
@@ -204,34 +335,80 @@ export default function AdminPage() {
         };
     }
   };
-  const handleLogout = () => {
-    localStorage.removeItem('adminSession');
-    toast.success('You have been logged out Successfully. ');
-    setTimeout(() =>{
-      window.location.href = '/admin';
-    },30000);
-  }; 
+
+  /**
+   * Logout Handler
+   */
+  const handleLogout = (showMessage: boolean = true) => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('adminSession');
+      setCurrentSession(null);
+      setIsAuthenticated(false);
+      setLoginAttempts(0);
+      
+      if (showMessage) {
+        toast.success('You have been logged out successfully.');
+      }
+      
+      // Clear form
+      setLoginForm({ username: '', password: '' });
+    }
+  };
+
+  // Show logout button if authenticated
+  if (isAuthenticated && currentSession) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center">
+        <Card className="w-full max-w-md shadow-2xl border-0">
+          <CardHeader className="text-center pb-8">
+            <div className="flex items-center justify-center space-x-2 mb-6">
+              <Shield className="h-12 w-12 text-primary" />
+            </div>
+            <CardTitle className="text-3xl bg-gradient-to-r from-green-600 to-blue-600 bg-clip-text text-transparent mb-2">
+              Welcome Back!
+            </CardTitle>
+            <p className="text-muted-foreground">
+              You are logged in as {currentSession.username} ({currentSession.role})
+            </p>
+          </CardHeader>
+          
+          <CardContent className="space-y-4">
+            <div className="bg-green-50 dark:bg-green-900/20 p-4 rounded-lg">
+              <h4 className="text-sm font-semibold text-green-800 dark:text-green-200 mb-2">
+                Session Information:
+              </h4>
+              <div className="space-y-1 text-xs text-green-700 dark:text-green-300">
+                <div><strong>Login Time:</strong> {new Date(currentSession.loginTime).toLocaleString()}</div>
+                <div><strong>Role:</strong> {currentSession.role}</div>
+                <div><strong>Session Timeout:</strong> 3 minutes of inactivity</div>
+              </div>
+            </div>
+            
+            <div className="flex space-x-2">
+              <Button 
+                onClick={() => window.location.href = '/admin/dashboard'} 
+                className="flex-1"
+              >
+                Go to Dashboard
+              </Button>
+              <Button variant="outline" onClick={() => handleLogout()}>
+                Logout
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center">
-      {/* Logout Button
-      {typeof window !== 'undefined' && localStorage.getItem('adminSession') && (
-        <div className="absolute top-4 right-4">
-          <Button variant="destructive" onClick={handleLogout}>
-            Logout
-          </Button>
-        </div>
-      )} */}
       <Card className="w-full max-w-md shadow-2xl border-0">
         <CardHeader className="text-center pb-8">
           <div className="flex items-center justify-center space-x-2 mb-6">
             <div className="relative">
               <Shield className="h-12 w-12 text-primary" />
-              {/* <div className="absolute -top-1 -right-1 w-4 h-4 bg-gradient-to-r from-yellow-400 to-orange-500 rounded-full flex items-center justify-center">
-                <Bike className="h-2 w-2 text-white" />
-              </div> */}
             </div>
-            {/* <TreePine className="h-10 w-10 text-green-600" /> */}
           </div>
           <CardTitle className="text-3xl bg-gradient-to-r from-green-600 to-blue-600 bg-clip-text text-transparent mb-2">
             Admin Login
@@ -299,29 +476,17 @@ export default function AdminPage() {
               )}
             </Button>
             
-            {/* Demo Credentials Info */}
-            {/* <div className="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
+            {/* Session Info */}
+            <div className="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
               <h4 className="text-sm font-semibold text-blue-800 dark:text-blue-200 mb-2">
-                Demo Credentials:
+                Session Security:
               </h4>
               <div className="space-y-1 text-xs text-blue-700 dark:text-blue-300">
-                <div><strong>Super Admin:</strong> admin / saveearthride2024</div>
-                <div><strong>Manager:</strong> manager / manager123</div>
+                <div>• Sessions expire after 3 minutes of inactivity</div>
+                <div>• Maximum 5 login attempts before lockout</div>
+                <div>• Secure API-based authentication</div>
               </div>
-            </div> */}
-            
-            {/* Role Information */}
-            {/* <div className="bg-green-50 dark:bg-green-900/20 p-4 rounded-lg">
-              <h4 className="text-sm font-semibold text-green-800 dark:text-green-200 mb-2">
-                Role Permissions:
-              </h4>
-              <div className="space-y-1 text-xs text-green-700 dark:text-green-300">
-                <div><strong>Super Admin:</strong> Full access to all features</div>
-                <div><strong>Admin:</strong> Manage data, limited admin access</div>
-                <div><strong>Manager:</strong> View and export data only</div>
-                <div><strong>Editor:</strong> Content editing permissions</div>
-              </div>
-            </div> */}
+            </div>
           </form>
         </CardContent>
       </Card>

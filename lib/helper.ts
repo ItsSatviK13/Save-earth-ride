@@ -1,4 +1,5 @@
-import { getSheetsClient, SPREADSHEET_ID } from './googlesheet';
+import clientPromise from './mongo';
+import { Collection, Document } from 'mongodb';
 
 export interface TreeCountData {
   count: number;
@@ -33,185 +34,135 @@ export interface DashboardData {
   totalRiders: number;
 }
 
-/**
- * Fetch tree count data from Google Sheets
- */
+const DB_NAME             = process.env.MONGODB_DB || 'app';
+const TREE_COLLECTION     = 'treecounter';
+const DONATIONS_COLLECTION = 'donations';
+const REG_COLLECTION       = 'helperRegistration';
+
+const CACHE_TTL = 5 * 60_000; 
+
+type Cache<T> = { data: T; at: number };
+
+let treeCache: Cache<TreeCountData>            | null = null;
+let donationCache: Cache<DonationData[]>       | null = null;
+let registrationCache: Cache<RegistrationData[]> | null = null;
+
+async function getCollection<T extends Document = Document>(
+  name: string,
+): Promise<Collection<T>> {
+  const client = await clientPromise;
+  return client.db(DB_NAME).collection<T>(name);
+}
+
 export async function getTreeCountData(): Promise<TreeCountData> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Fetch data from 'treecounter' sheet
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'treecounter!A:C', // Assuming columns: Count, Last Updated, Notes
-    });
+  const now = Date.now();
+  if (treeCache && now - treeCache.at < CACHE_TTL) return treeCache.data;
 
-    const rows = response.data.values || [];
-    
-    if (rows.length < 2) {
-      // Return default if no data
-      return {
-        count: 25847,
-        lastUpdated: new Date().toISOString()
-      };
-    }
+  const col = await getCollection<TreeCountData>(TREE_COLLECTION);
 
-    // Skip header row and get the latest entry
-    const latestRow = rows[rows.length - 1];
-    
-    return {
-      count: parseInt(latestRow[0]) || 25847,
-      lastUpdated: latestRow[1] || new Date().toISOString()
-    };
-  } catch (error) {
-    console.error('Error fetching tree count data:', error);
-    return {
-      count: 25847,
-      lastUpdated: new Date().toISOString()
-    };
-  }
+  const doc = await col
+    .find({})
+    .sort({ lastUpdated: -1 })
+    .limit(1)
+    .next() as TreeCountData | null;
+
+  const result: TreeCountData = doc
+    ? { count: doc.count, lastUpdated: doc.lastUpdated }
+    : { count: 25_847, lastUpdated: new Date().toISOString() };
+
+  treeCache = { data: result, at: now };
+  return result;
 }
 
-/**
- * Update tree count in Google Sheets
- */
 export async function updateTreeCount(newCount: number): Promise<boolean> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Append new tree count entry
-    const response = await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'treecounter!A:C',
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [[newCount, new Date().toISOString(), 'Updated via admin dashboard']]
-      }
-    });
-
-    return response.status === 200;
-  } catch (error) {
-    console.error('Error updating tree count:', error);
-    return false;
-  }
+  const col = await getCollection<TreeCountData>(TREE_COLLECTION);
+  const res = await col.insertOne({
+    count: newCount,
+    lastUpdated: new Date().toISOString(),
+  });
+  treeCache = null; 
+  return res.acknowledged;
 }
 
-/**
- * Fetch donations data from Google Sheets
- */
 export async function getDonationsData(): Promise<DonationData[]> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Fetch data from 'donations' sheet
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'donations!A:H', // Assuming columns: ID, Name, Amount, Currency, Date, Email, Message, Status
-    });
-
-    const rows = response.data.values || [];
-    
-    if (rows.length < 2) {
-      return [];
-    }
-
-    // Skip header row and convert to DonationData
-    const donations: DonationData[] = rows.slice(1).map((row, index) => ({
-      id: row[0] || `donation-${index + 1}`,
-      name: row[1] || 'Anonymous',
-      amount: parseFloat(row[2]) || 0,
-      currency: row[3] || 'USD',
-      date: row[4] || new Date().toISOString().split('T')[0],
-      email: row[5] || undefined,
-      message: row[6] || undefined,
-    }));
-
-    // Return recent donations (last 10, sorted by date)
-    return donations
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-      .slice(0, 10);
-  } catch (error) {
-    console.error('Error fetching donations data:', error);
-    return [];
+  const now = Date.now();
+  if (donationCache && now - donationCache.at < CACHE_TTL) {
+    return donationCache.data;
   }
+
+  const col = await getCollection<DonationData>(DONATIONS_COLLECTION);
+  const docs = await col
+    .find({}, { projection: { _id: 0 } })
+    .sort({ date: -1 })
+    .limit(10)
+    .toArray();
+
+  donationCache = { data: docs, at: now };
+  return docs;
 }
 
-/**
- * Fetch registrations data from Google Sheets
- */
+export async function addDonation(
+  donation: Omit<DonationData, 'id'>,
+): Promise<boolean> {
+  const col = await getCollection<DonationData>(DONATIONS_COLLECTION);
+  const doc: DonationData = {
+    id: `donation-${Date.now()}`,
+    ...donation,
+  };
+  const res = await col.insertOne(doc);
+  donationCache = null;
+  return res.acknowledged;
+}
+
 export async function getRegistrationsData(): Promise<RegistrationData[]> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Fetch data from 'registrations' sheet
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'registrations!A:H', // Assuming columns: ID, Name, Type, Location, Date, Email, Phone, BikeModel
-    });
-
-    const rows = response.data.values || [];
-    
-    if (rows.length < 2) {
-      return [];
-    }
-
-    // Skip header row and convert to RegistrationData
-    const registrations: RegistrationData[] = rows.slice(1).map((row, index) => ({
-      id: row[0] || `registration-${index + 1}`,
-      name: row[1] || 'Unknown',
-      type: (row[2] === 'Club' ? 'Club' : 'Individual') as 'Individual' | 'Club',
-      location: row[3] || 'Unknown',
-      date: row[4] || new Date().toISOString().split('T')[0],
-      email: row[5] || undefined,
-      phone: row[6] || undefined,
-      bikeModel: row[7] || undefined,
-    }));
-
-    // Return recent registrations (last 10, sorted by date)
-    return registrations
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-      .slice(0, 10);
-  } catch (error) {
-    console.error('Error fetching registrations data:', error);
-    return [];
+  const now = Date.now();
+  if (registrationCache && now - registrationCache.at < CACHE_TTL) {
+    return registrationCache.data;
   }
+
+  const col = await getCollection<RegistrationData>(REG_COLLECTION);
+  const docs = await col
+    .find({}, { projection: { _id: 0 } })
+    .sort({ date: -1 })
+    .limit(10)
+    .toArray();
+
+  registrationCache = { data: docs, at: now };
+  return docs;
 }
 
-/**
- * Calculate total riders from registrations
- */
+export async function addRegistration(
+  registration: Omit<RegistrationData, 'id'>,
+): Promise<boolean> {
+  const col = await getCollection<RegistrationData>(REG_COLLECTION);
+  const doc: RegistrationData = {
+    id: `registration-${Date.now()}`,
+    ...registration,
+  };
+  const res = await col.insertOne(doc);
+  registrationCache = null;
+  return res.acknowledged;
+}
+
 export async function getTotalRiders(): Promise<number> {
   try {
-    const registrations = await getRegistrationsData();
-    // In a real scenario, you might want to get all registrations, not just recent ones
-    // For now, we'll use a larger range to get all registrations
-    const sheets = await getSheetsClient();
-    
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'registrations!A:A', // Just get all IDs to count
-    });
-
-    const rows = response.data.values || [];
-    // Subtract 1 for header row
-    return Math.max(0, rows.length - 1);
-  } catch (error) {
-    console.error('Error calculating total riders:', error);
-    return 52340; // Default fallback
+    const col = await getCollection(REG_COLLECTION);
+    return await col.estimatedDocumentCount();
+  } catch (err) {
+    console.error('Error calculating total riders:', err);
+    return 52_340; 
   }
 }
 
-/**
- * Fetch all dashboard data
- */
 export async function getDashboardData(): Promise<DashboardData> {
   try {
-    const [treeCount, donations, registrations, totalRiders] = await Promise.all([
-      getTreeCountData(),
-      getDonationsData(),
-      getRegistrationsData(),
-      getTotalRiders(),
-    ]);
+    const [treeCount, donations, registrations, totalRiders] =
+      await Promise.all([
+        getTreeCountData(),
+        getDonationsData(),
+        getRegistrationsData(),
+        getTotalRiders(),
+      ]);
 
     return {
       treeCount,
@@ -219,84 +170,13 @@ export async function getDashboardData(): Promise<DashboardData> {
       recentRegistrations: registrations,
       totalRiders,
     };
-  } catch (error) {
-    console.error('Error fetching dashboard data:', error);
-    // Return default data on error
+  } catch (err) {
+    console.error('Error fetching dashboard data:', err);
     return {
-      treeCount: { count: 25847, lastUpdated: new Date().toISOString() },
+      treeCount: { count: 25_847, lastUpdated: new Date().toISOString() },
       recentDonations: [],
       recentRegistrations: [],
-      totalRiders: 52340,
+      totalRiders: 52_340,
     };
-  }
-}
-
-/**
- * Add a new donation to Google Sheets
- */
-export async function addDonation(donation: Omit<DonationData, 'id'>): Promise<boolean> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Generate a unique ID
-    const id = `donation-${Date.now()}`;
-    
-    const response = await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'donations!A:H',
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [[
-          id,
-          donation.name,
-          donation.amount,
-          donation.currency,
-          donation.date,
-          donation.email || '',
-          donation.message || '',
-          'Confirmed'
-        ]]
-      }
-    });
-
-    return response.status === 200;
-  } catch (error) {
-    console.error('Error adding donation:', error);
-    return false;
-  }
-}
-
-/**
- * Add a new registration to Google Sheets
- */
-export async function addRegistration(registration: Omit<RegistrationData, 'id'>): Promise<boolean> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Generate a unique ID
-    const id = `registration-${Date.now()}`;
-    
-    const response = await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'registrations!A:H',
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [[
-          id,
-          registration.name,
-          registration.type,
-          registration.location,
-          registration.date,
-          registration.email || '',
-          registration.phone || '',
-          registration.bikeModel || ''
-        ]]
-      }
-    });
-
-    return response.status === 200;
-  } catch (error) {
-    console.error('Error adding registration:', error);
-    return false;
   }
 }

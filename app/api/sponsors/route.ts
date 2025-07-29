@@ -1,52 +1,65 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { getSponsorData, saveSponsorData, addSponsorData, updateSponsorData, deleteSponsorData } from '@/lib/sponsorSheetHelpers';
+import { NextRequest, NextResponse } from 'next/server'
+import {
+  getSponsorData,
+  addSponsorData,
+  updateSponsorData,
+  deleteSponsorData,
+  SponsorData
+} from '@/lib/sponsorSheetHelpers'
+
+export const dynamic = 'force-static'
 
 export async function GET() {
   try {
-    const sponsors = await getSponsorData();
-    return NextResponse.json({ success: true, data: sponsors });
-  } catch (error) {
-    console.error('Error fetching sponsors:', error);
+    return NextResponse.json({ success: true, data: await getSponsorData() })
+  } catch (err) {
+    console.error(err)
     return NextResponse.json(
       { success: false, error: 'Failed to fetch sponsors' },
       { status: 500 }
-    );
+    )
   }
 }
-export const dynamic = "force-static";
-export async function POST(request: NextRequest) {
+
+type Payload =
+  | { action: 'add';    data: Omit<SponsorData, 'id'> }
+  | { action: 'update'; data: Partial<SponsorData> & { id: number } }
+  | { action: 'delete'; data: { id: number } }
+
+export async function POST(req: NextRequest) {
   try {
-    const body = await request.json();
-    const { action, data } = body;
+    const body = (await req.json()) as Payload
 
-    switch (action) {
+    switch (body.action) {
       case 'add':
-        const newSponsor = await addSponsorData(data);
-        return NextResponse.json({ success: true, data: newSponsor });
+        return NextResponse.json({
+          success: true,
+          data: await addSponsorData(body.data)
+        })
 
-      case 'update':
-        const updatedSponsor = await updateSponsorData(data.id, data);
-        return NextResponse.json({ success: true, data: updatedSponsor });
+      case 'update': {
+        const { id, ...u } = body.data
+        return NextResponse.json({
+          success: true,
+          data: await updateSponsorData(id, u)
+        })
+      }
 
       case 'delete':
-        await deleteSponsorData(data.id);
-        return NextResponse.json({ success: true, message: 'Sponsor deleted successfully' });
-
-      case 'bulk_save':
-        await saveSponsorData(data);
-        return NextResponse.json({ success: true, message: 'Sponsors saved successfully' });
+        await deleteSponsorData(body.data.id)
+        return NextResponse.json({ success: true })
 
       default:
         return NextResponse.json(
           { success: false, error: 'Invalid action' },
           { status: 400 }
-        );
+        )
     }
-  } catch (error) {
-    console.error('Error processing sponsor request:', error);
+  } catch (err) {
+    console.error(err)
     return NextResponse.json(
       { success: false, error: 'Failed to process request' },
       { status: 500 }
-    );
+    )
   }
 }

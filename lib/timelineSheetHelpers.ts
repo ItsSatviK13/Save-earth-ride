@@ -1,4 +1,6 @@
-import { getSheetsClient, SPREADSHEET_ID } from './googlesheet';
+
+import clientPromise from './mongo';
+import { Collection } from 'mongodb';
 
 export interface TimelineItem {
   id: number;
@@ -14,225 +16,104 @@ export interface TimelineItem {
   contactEmail?: string;
 }
 
-const TIMELINE_SHEET_NAME = 'timeline';
+const COLLECTION_NAME = 'timeline';                 
+const DB_NAME         = process.env.MONGODB_DB || 'app';
+const CACHE_TTL       = 5 * 60_000;                  
 
-/**
- * Get all timeline data from Google Sheets
- */
+interface CacheEntry {
+  data: TimelineItem[];
+  timestamp: number;
+}
+
+let cache: CacheEntry | null = null;
+let collectionReady = false;
+
+async function getCollection(): Promise<Collection<TimelineItem>> {
+  const client = await clientPromise;
+  const col    = client.db(DB_NAME).collection<TimelineItem>(COLLECTION_NAME);
+
+  if (!collectionReady) {
+    await col.createIndex({ id: 1 }, { unique: true });
+    collectionReady = true;
+  }
+  return col;
+}
+
 export async function getTimelineData(): Promise<TimelineItem[]> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Get all data from the timeline sheet
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${TIMELINE_SHEET_NAME}!A:K`, // Adjust range as needed
-    });
+  const now = Date.now();
+  if (cache && now - cache.timestamp < CACHE_TTL) return cache.data;
 
-    const rows = response.data.values;
-    
-    if (!rows || rows.length <= 1) {
-      return [];
-    }
+  const col   = await getCollection();
+  const docs  = await col.find({}).sort({ id: 1 }).toArray();
+  const items = docs.map(({ _id, ...rest }) => rest as TimelineItem);
 
-    // Skip header row and convert to objects
-    const timelineData = rows.slice(1).map((row, index) => ({
-      id: parseInt(row[0]) || index + 1,
-      date: row[1] || '',
-      title: row[2] || '',
-      location: row[3] || '',
-      type: row[4] || '',
-      participants: parseInt(row[5]) || 0,
-      treesPlanted: parseInt(row[6]) || 0,
-      description: row[7] || '',
-      image: row[8] || '',
-      side: (row[9] === 'right' ? 'right' : 'left') as 'left' | 'right',
-      contactEmail: row[10] || '',
-    }));
-
-    return timelineData;
-  } catch (error) {
-    console.error('Error fetching timeline data:', error);
-    throw new Error('Failed to fetch timeline data from Google Sheets');
-  }
+  cache = { data: items, timestamp: now };
+  return items;
 }
 
-/**
- * Save timeline data to Google Sheets
- */
-export async function saveTimelineData(timelineData: TimelineItem[]): Promise<void> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Prepare data for sheets (convert objects to arrays)
-    const headers = [
-      'ID', 'Date', 'Title', 'Location', 'Type', 
-      'Participants', 'Trees Planted', 'Description', 
-      'Image', 'Side', 'Contact Email'
-    ];
-    
-    const values = [
-      headers,
-      ...timelineData.map(item => [
-        item.id.toString(),
-        item.date,
-        item.title,
-        item.location,
-        item.type,
-        item.participants.toString(),
-        item.treesPlanted.toString(),
-        item.description,
-        item.image,
-        item.side,
-        item.contactEmail || ''
-      ])
-    ];
-
-    // Clear existing data and write new data
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${TIMELINE_SHEET_NAME}!A:K`,
-    });
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${TIMELINE_SHEET_NAME}!A1`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: values,
-      },
-    });
-
-    console.log('Timeline data saved to Google Sheets successfully');
-  } catch (error) {
-    console.error('Error saving timeline data:', error);
-    throw new Error('Failed to save timeline data to Google Sheets');
+export async function saveTimelineData(
+  timelineData: TimelineItem[],
+): Promise<void> {
+  const col = await getCollection();
+  await col.deleteMany({});
+  if (timelineData.length) {
+    await col.insertMany(timelineData);
   }
+  cache = { data: timelineData, timestamp: Date.now() };
 }
 
-/**
- * Add a new timeline item to Google Sheets
- */
-export async function addTimelineItem(item: Omit<TimelineItem, 'id'>): Promise<TimelineItem> {
-  try {
-    const currentData = await getTimelineData();
-    const newId = Math.max(...currentData.map(d => d.id), 0) + 1;
-    
-    const newItem: TimelineItem = {
-      ...item,
-      id: newId,
-    };
+export async function addTimelineItem(
+  item: Omit<TimelineItem, 'id'>,
+): Promise<TimelineItem> {
+  const current = await getTimelineData();
+  const newId   = current.length ? Math.max(...current.map((d) => d.id)) + 1 : 1;
 
-    const updatedData = [...currentData, newItem];
-    await saveTimelineData(updatedData);
-    
-    return newItem;
-  } catch (error) {
-    console.error('Error adding timeline item:', error);
-    throw new Error('Failed to add timeline item to Google Sheets');
+  const newItem: TimelineItem = { ...item, id: newId };
+
+  const col = await getCollection();
+  await col.insertOne({ ...newItem });
+
+  if (cache) {
+    cache.data.push(newItem);
+    cache.timestamp = Date.now();
   }
+  return newItem;
 }
 
-/**
- * Update an existing timeline item in Google Sheets
- */
-export async function updateTimelineItem(id: number, updates: Partial<TimelineItem>): Promise<TimelineItem> {
-  try {
-    const currentData = await getTimelineData();
-    const itemIndex = currentData.findIndex(item => item.id === id);
-    
-    if (itemIndex === -1) {
-      throw new Error('Timeline item not found');
-    }
+export async function updateTimelineItem(
+  id: number,
+  updates: Partial<TimelineItem>,
+): Promise<TimelineItem> {
+  const col = await getCollection();
 
-    const updatedItem = { ...currentData[itemIndex], ...updates, id };
-    currentData[itemIndex] = updatedItem;
-    
-    await saveTimelineData(currentData);
-    
-    return updatedItem;
-  } catch (error) {
-    console.error('Error updating timeline item:', error);
-    throw new Error('Failed to update timeline item in Google Sheets');
+  const res = await col.findOneAndUpdate(
+    { id },
+    { $set: { ...updates } },
+    { returnDocument: 'after' },
+  );
+  if (!res) throw new Error('Timeline item not found');
+  const { _id, ...updated } = res as any;
+
+  if (cache) {
+    const idx = cache.data.findIndex((d) => d.id === id);
+    if (idx !== -1) cache.data[idx] = updated as TimelineItem;
+    cache.timestamp = Date.now();
   }
+  return updated as TimelineItem;
 }
 
-/**
- * Delete a timeline item from Google Sheets
- */
 export async function deleteTimelineItem(id: number): Promise<void> {
-  try {
-    const currentData = await getTimelineData();
-    const filteredData = currentData.filter(item => item.id !== id);
-    
-    if (filteredData.length === currentData.length) {
-      throw new Error('Timeline item not found');
-    }
-    
-    await saveTimelineData(filteredData);
-  } catch (error) {
-    console.error('Error deleting timeline item:', error);
-    throw new Error('Failed to delete timeline item from Google Sheets');
+  const col = await getCollection();
+  const res = await col.deleteOne({ id });
+  if (res.deletedCount === 0) throw new Error('Timeline item not found');
+
+  if (cache) {
+    const idx = cache.data.findIndex((d) => d.id === id);
+    if (idx !== -1) cache.data.splice(idx, 1);
+    cache.timestamp = Date.now();
   }
 }
 
-/**
- * Initialize timeline sheet with headers if it doesn't exist
- */
 export async function initializeTimelineSheet(): Promise<void> {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Check if timeline sheet exists
-    const spreadsheet = await sheets.spreadsheets.get({
-      spreadsheetId: SPREADSHEET_ID,
-    });
-    
-    const timelineSheet = spreadsheet.data.sheets?.find(
-      sheet => sheet.properties?.title === TIMELINE_SHEET_NAME
-    );
-    
-    if (!timelineSheet) {
-      // Create the timeline sheet
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        requestBody: {
-          requests: [{
-            addSheet: {
-              properties: {
-                title: TIMELINE_SHEET_NAME,
-              },
-            },
-          }],
-        },
-      });
-    }
-    
-    // Check if headers exist
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${TIMELINE_SHEET_NAME}!A1:K1`,
-    });
-    
-    if (!response.data.values || response.data.values.length === 0) {
-      // Add headers
-      const headers = [
-        'ID', 'Date', 'Title', 'Location', 'Type', 
-        'Participants', 'Trees Planted', 'Description', 
-        'Image', 'Side', 'Contact Email'
-      ];
-      
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${TIMELINE_SHEET_NAME}!A1`,
-        valueInputOption: 'RAW',
-        requestBody: {
-          values: [headers],
-        },
-      });
-    }
-  } catch (error) {
-    console.error('Error initializing timeline sheet:', error);
-    throw new Error('Failed to initialize timeline sheet');
-  }
+  await getCollection(); 
 }

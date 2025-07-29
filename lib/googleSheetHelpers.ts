@@ -1,175 +1,148 @@
-// lib/googleSheetHelpers.ts
-import { getSheetsClient, SPREADSHEET_ID } from './googlesheet';
+import clientPromise from './mongo';
+import { Collection } from 'mongodb';
 
-const ADMIN_SHEET_NAME = 'admins';
-
-export async function readAdminsFromSheet() {
-  const sheets = await getSheetsClient();
-
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${ADMIN_SHEET_NAME}!A2:H`,
-  });
-
-  const rows = response.data.values || [];
-
-  return rows.map((row, index) => ({
-    id: Number(row[0]),
-    username: row[1],
-    email: row[2],
-    password: row[3],
-    role: row[4],
-    createdAt: row[5],
-    lastLogin: row[6],
-    status: row[7],
-  }));
+export interface Admin {
+  id: number;
+  username: string;
+  email: string;
+  password: string;
+  role: string;
+  createdAt?: string;
+  lastLogin?: string;
+  status?: string;
 }
 
-export async function writeAdminsToSheet(admins: any[]) {
-  const sheets = await getSheetsClient();
+const DB_NAME           = process.env.MONGODB_DB || 'app';
+const ADMIN_COLLECTION  = 'admins';          
+const CACHE_TTL         = 5 * 60_000;        
 
-  // Step 1: Read existing data
-  const existingAdmins = await readAdminsFromSheet();
-  
-  // Create a set of existing IDs for quick lookup
-  const existingIds = new Set(existingAdmins.map(admin => admin.id.toString()));
-  
-  // Create a map of existing admins by ID for updates
-  const existingAdminMap = new Map(
-    existingAdmins.map((admin, index) => [admin.id.toString(), { admin, rowIndex: index + 2 }])
+interface CacheEntry {
+  data: Admin[];
+  timestamp: number;
+}
+
+let cache: CacheEntry | null = null;
+let collectionReady = false;
+
+async function getCollection(): Promise<Collection<Admin>> {
+  const client = await clientPromise;
+  const col    = client.db(DB_NAME).collection<Admin>(ADMIN_COLLECTION);
+
+  if (!collectionReady) {
+    await col.createIndex({ id: 1 }, { unique: true });
+    collectionReady = true;
+  }
+  return col;
+}
+
+function hasAdminChanged(existing: Admin, incoming: Admin): boolean {
+  const fields = [
+    'username',
+    'email',
+    'password',
+    'role',
+    'createdAt',
+    'lastLogin',
+    'status',
+  ] as const;
+
+  return fields.some(
+    (f) => (existing as any)[f] !== (incoming as any)[f],
   );
+}
 
-  // Separate new admins from updates
-  const newAdmins: any[] = [];
-  const updatedAdmins: { admin: any; rowIndex: number }[] = [];
 
-  admins.forEach((admin) => {
-    const adminId = admin.id.toString();
-    
-    if (existingIds.has(adminId)) {
-      // This admin exists, check if it needs updating
-      const existingData = existingAdminMap.get(adminId);
-      if (existingData && hasAdminChanged(existingData.admin, admin)) {
-        updatedAdmins.push({ admin, rowIndex: existingData.rowIndex });
-      }
-    } else {
-      // This is a new admin
-      newAdmins.push(admin);
+export async function readAdminsFromSheet(): Promise<Admin[]> {
+  const now = Date.now();
+  if (cache && now - cache.timestamp < CACHE_TTL) return cache.data;
+
+  const col   = await getCollection();
+  const docs  = await col.find({}).toArray();
+  const admins = docs.map(({ _id, ...rest }) => rest as Admin);
+
+  cache = { data: admins, timestamp: now };
+  return admins;
+}
+
+
+export async function writeAdminsToSheet(admins: Admin[]) {
+  const col            = await getCollection();
+  const existingAdmins = await readAdminsFromSheet();
+  const existingMap    = new Map(existingAdmins.map((a) => [a.id, a]));
+
+  const newAdmins: Admin[] = [];
+  const changedAdmins: Admin[] = [];
+
+  admins.forEach((adm) => {
+    const prev = existingMap.get(adm.id);
+    if (!prev) {
+      newAdmins.push(adm);
+    } else if (hasAdminChanged(prev, adm)) {
+      changedAdmins.push(adm);
     }
   });
 
-  console.log(`Found ${newAdmins.length} new admins and ${updatedAdmins.length} admins to update`);
-
-  // Step 2: Update existing rows that have changed
-  for (const { admin, rowIndex } of updatedAdmins) {
-    const values = [
-      admin.id ?? '',
-      admin.username ?? '',
-      admin.email ?? '',
-      admin.password ?? '',
-      admin.role ?? '',
-      admin.createdAt ?? '',
-      admin.lastLogin ?? '',
-      admin.status ?? '',
-    ];
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${ADMIN_SHEET_NAME}!A${rowIndex}:H${rowIndex}`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [values],
-      },
-    });
+  if (changedAdmins.length) {
+    await col.bulkWrite(
+      changedAdmins.map((adm) => ({
+        updateOne: {
+          filter: { id: adm.id },
+          update: { $set: { ...adm } },
+        },
+      })),
+    );
   }
 
-  // Step 3: Append only new rows
-  if (newAdmins.length > 0) {
-    const newRows = newAdmins.map(admin => [
-      admin.id ?? '',
-      admin.username ?? '',
-      admin.email ?? '',
-      admin.password ?? '',
-      admin.role ?? '',
-      admin.createdAt ?? '',
-      admin.lastLogin ?? '',
-      admin.status ?? '',
-    ]);
-
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${ADMIN_SHEET_NAME}!A2:H`,
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: {
-        values: newRows,
-      },
-    });
+  if (newAdmins.length) {
+    await col.insertMany(newAdmins);
   }
 
-  return { 
-    success: true, 
-    newAdmins: newAdmins.length, 
-    updatedAdmins: updatedAdmins.length 
+  if (cache) {
+    changedAdmins.forEach((adm) => {
+      const idx = cache!.data.findIndex((a) => a.id === adm.id);
+      if (idx !== -1) cache!.data[idx] = adm;
+    });
+    cache.data.push(...newAdmins);
+    cache.timestamp = Date.now();
+  }
+
+  return {
+    success: true,
+    newAdmins: newAdmins.length,
+    updatedAdmins: changedAdmins.length,
   };
 }
 
-// Helper function to check if admin data has changed
-function hasAdminChanged(existing: any, incoming: any): boolean {
-  const fieldsToCompare = ['username', 'email', 'password', 'role', 'createdAt', 'lastLogin', 'status'];
-  
-  return fieldsToCompare.some(field => {
-    const existingValue = existing[field] || '';
-    const incomingValue = incoming[field] || '';
-    return existingValue !== incomingValue;
-  });
-}
 
-// Alternative function that completely replaces the sheet data (use with caution)
-export async function replaceAdminsInSheet(admins: any[]) {
-  const sheets = await getSheetsClient();
-
-  // First, clear existing data (except headers)
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${ADMIN_SHEET_NAME}!A2:H`,
-  });
-
-  // Then write all the new data
-  if (admins.length > 0) {
-    const rows = admins.map(admin => [
-      admin.id ?? '',
-      admin.username ?? '',
-      admin.email ?? '',
-      admin.password ?? '',
-      admin.role ?? '',
-      admin.createdAt ?? '',
-      admin.lastLogin ?? '',
-      admin.status ?? '',
-    ]);
-
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${ADMIN_SHEET_NAME}!A2:H`,
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: {
-        values: rows,
-      },
-    });
+export async function replaceAdminsInSheet(admins: Admin[]) {
+  const col = await getCollection();
+  await col.deleteMany({});
+  if (admins.length) {
+    await col.insertMany(admins);
   }
-
+  cache = null;
   return { success: true, totalAdmins: admins.length };
 }
 
-// Function to add a single admin (with duplicate check)
-export async function addSingleAdmin(admin: any) {
-  const existingAdmins = await readAdminsFromSheet();
-  const existingIds = new Set(existingAdmins.map(a => a.id.toString()));
-  
-  if (existingIds.has(admin.id.toString())) {
+
+export async function addSingleAdmin(admin: Admin) {
+  const col   = await getCollection();
+  const found = await col.findOne({ id: admin.id });
+  if (found) {
     return { success: false, message: 'Admin already exists' };
   }
-  
-  return await writeAdminsToSheet([admin]);
+  await writeAdminsToSheet([admin]);
+  return { success: true, message: 'Admin added' };
+}
+
+export function invalidateAdminCache() {
+  cache = null;
+}
+
+export function getAdminCacheStats() {
+  return {
+    cached: cache !== null,
+    age: cache ? Date.now() - cache.timestamp : 0,
+    size: cache ? cache.data.length : 0,
+  };
 }

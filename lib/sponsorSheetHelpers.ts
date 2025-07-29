@@ -1,27 +1,26 @@
-import { getSheetsClient, SPREADSHEET_ID } from './googlesheet';
-import { sheets_v4 } from 'googleapis';
+import clientPromise from './mongo'
+import { Collection, Document } from 'mongodb'
 
-const SPONSORS_SHEET = 'sponsors';
+/* ── data model that matches your validator ───────── */
+export interface SponsorData extends Document {
+  id: number
+  name: string
+  logo: string
+  tier: string
+  website: string
+  description: string
+  contribution: string
+  since: number
+  category: string
+  type: string              // sponsor | partner | donor
 
-// Define the sponsor data structure
-interface SponsorData {
-  id: number;
-  name: string;
-  logo: string;
-  tier: string;
-  website: string;
-  description: string;
-  contribution: string;
-  since: string;
-  category: string;
-  contactEmail: string;
-  contactPerson: string;
-  amount: number;
-  type: string;
+  /* new optional fields */
+  company_name?: string
+  email?: string
+  phone_number?: string
 }
 
-// Column headers for the Google Sheet
-const HEADERS = [
+const HEADERS: (keyof SponsorData)[] = [
   'id',
   'name',
   'logo',
@@ -31,233 +30,103 @@ const HEADERS = [
   'contribution',
   'since',
   'category',
-  'contactEmail',
-  'contactPerson',
-  'amount',
-  'type'
-];
+  'type',
+  'company_name',
+  'email',
+  'phone_number'
+]
 
-// Helper function to ensure the sponsors sheet exists
-async function ensureSponsorSheet() {
-  try {
-    const sheets = await getSheetsClient();
-    
-    // Check if the sponsors sheet exists
-    const spreadsheet = await sheets.spreadsheets.get({
-      spreadsheetId: SPREADSHEET_ID,
-    });
+const COLLECTION_NAME = 'sponsors'
+const DB_NAME         = process.env.MONGODB_DB ?? 'app'
+const CACHE_TTL       = 5 * 60_000   // five minutes
 
-    const sponsorSheet = spreadsheet.data.sheets?.find(
-      sheet => sheet.properties?.title === SPONSORS_SHEET
-    );
+let collectionReady = false
+async function getCollection(): Promise<Collection<SponsorData>> {
+  const client = await clientPromise
+  const col    = client.db(DB_NAME).collection<SponsorData>(COLLECTION_NAME)
 
-    if (!sponsorSheet) {
-      // Create the sponsors sheet if it doesn't exist
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        requestBody: {
-          requests: [
-            {
-              addSheet: {
-                properties: {
-                  title: SPONSORS_SHEET,
-                },
-              },
-            },
-          ],
-        },
-      });
-
-      // Add headers to the new sheet
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${SPONSORS_SHEET}!A1:M1`,
-        valueInputOption: 'RAW',
-        requestBody: {
-          values: [HEADERS],
-        },
-      });
-    }
-  } catch (error) {
-    console.error('Error ensuring sponsor sheet exists:', error);
-    throw error;
+  if (!collectionReady) {
+    await col.createIndex({ id: 1 }, { unique: true })
+    collectionReady = true
   }
+  return col
 }
 
-// Convert row data to sponsor object
-function rowToSponsor(row: any[], index: number): SponsorData {
-  return {
-    id: parseInt(row[0]) || index + 1,
-    name: row[1] || '',
-    logo: row[2] || '',
-    tier: row[3] || '',
-    website: row[4] || '',
-    description: row[5] || '',
-    contribution: row[6] || '',
-    since: row[7] || '',
-    category: row[8] || '',
-    contactEmail: row[9] || '',
-    contactPerson: row[10] || '',
-    amount: parseFloat(row[11]) || 0,
-    type: row[12] || 'sponsor'
-  };
-}
+/* ── simple in-memory cache ───────────────────────── */
+interface Cache { data: SponsorData[]; timestamp: number }
+let cache: Cache | null = null
 
-// Convert sponsor object to row data
-function sponsorToRow(sponsor: SponsorData): any[] {
-  return [
-    sponsor.id,
-    sponsor.name,
-    sponsor.logo,
-    sponsor.tier,
-    sponsor.website,
-    sponsor.description,
-    sponsor.contribution,
-    sponsor.since,
-    sponsor.category,
-    sponsor.contactEmail,
-    sponsor.contactPerson,
-    sponsor.amount,
-    sponsor.type
-  ];
-}
-
-// Get all sponsor data from Google Sheets
 export async function getSponsorData(): Promise<SponsorData[]> {
-  try {
-    await ensureSponsorSheet();
-    const sheets = await getSheetsClient();
+  const now = Date.now()
+  if (cache && now - cache.timestamp < CACHE_TTL) return cache.data
 
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${SPONSORS_SHEET}!A2:M`,
-    });
+  const data = await (await getCollection())
+    .find({})
+    .sort({ id: 1 })
+    .toArray()
 
-    const rows = response.data.values || [];
-    return rows.map((row, index) => rowToSponsor(row, index));
-  } catch (error) {
-    console.error('Error fetching sponsor data:', error);
-    throw error;
-  }
+  cache = { data, timestamp: now }
+  return data
 }
 
-// Save all sponsor data to Google Sheets (overwrites existing data)
-export async function saveSponsorData(sponsors: SponsorData[]): Promise<void> {
-  try {
-    await ensureSponsorSheet();
-    const sheets = await getSheetsClient();
+export async function addSponsorData(
+  sponsor: Omit<SponsorData, 'id'>
+): Promise<SponsorData> {
+  const col    = await getCollection()
+  const last   = await col.find().sort({ id: -1 }).limit(1).next()
+  const nextId = last ? last.id + 1 : 1
 
-    // Clear existing data (except headers)
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${SPONSORS_SHEET}!A2:M`,
-    });
-
-    if (sponsors.length > 0) {
-      // Convert sponsors to rows
-      const rows = sponsors.map(sponsor => sponsorToRow(sponsor));
-
-      // Add the data
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${SPONSORS_SHEET}!A2:M${rows.length + 1}`,
-        valueInputOption: 'RAW',
-        requestBody: {
-          values: rows,
-        },
-      });
-    }
-  } catch (error) {
-    console.error('Error saving sponsor data:', error);
-    throw error;
+  /* Just attach the generated id—never blank-out caller data */
+  const doc: SponsorData = {
+    ...sponsor,
+    name: sponsor.name,
+    logo: sponsor.logo,
+    tier: sponsor.tier,
+    website: sponsor.website,
+    description: sponsor.description,
+    contribution: sponsor.contribution,
+    since: 0,
+    category: sponsor.category,
+    type: sponsor.type,
+    id: nextId, 
   }
+
+  await col.insertOne(doc)
+
+  if (cache) {
+    cache.data.push(doc)
+    cache.timestamp = Date.now()
+  }
+  return doc
 }
 
-// Add a new sponsor
-export async function addSponsorData(sponsor: Omit<SponsorData, 'id'>): Promise<SponsorData> {
-  try {
-    const existingSponsors = await getSponsorData();
-    const newId = existingSponsors.length > 0 ? Math.max(...existingSponsors.map(s => s.id)) + 1 : 1;
-    
-    const newSponsor: SponsorData = {
-      ...sponsor,
-      id: newId
-    };
+export async function updateSponsorData(
+  id: number,
+  updates: Partial<SponsorData>
+): Promise<SponsorData> {
+  const col = await getCollection()
+  const res = await col.findOneAndUpdate(
+    { id },
+    { $set: updates },
+    { returnDocument: 'after' }
+  )
+  if (!res?.value) throw new Error('Sponsor not found')
 
-    const updatedSponsors = [...existingSponsors, newSponsor];
-    await saveSponsorData(updatedSponsors);
-    
-    return newSponsor;
-  } catch (error) {
-    console.error('Error adding sponsor:', error);
-    throw error;
+  if (cache) {
+    const i = cache.data.findIndex(d => d.id === id)
+    if (i !== -1) cache.data[i] = res.value
+    cache.timestamp = Date.now()
   }
+  return res.value
 }
 
-// Update an existing sponsor
-export async function updateSponsorData(id: number, updatedSponsor: Partial<SponsorData>): Promise<SponsorData> {
-  try {
-    const existingSponsors = await getSponsorData();
-    const sponsorIndex = existingSponsors.findIndex(s => s.id === id);
-    
-    if (sponsorIndex === -1) {
-      throw new Error('Sponsor not found');
-    }
-
-    const updated = {
-      ...existingSponsors[sponsorIndex],
-      ...updatedSponsor,
-      id // Ensure ID doesn't change
-    };
-
-    existingSponsors[sponsorIndex] = updated;
-    await saveSponsorData(existingSponsors);
-    
-    return updated;
-  } catch (error) {
-    console.error('Error updating sponsor:', error);
-    throw error;
-  }
-}
-
-// Delete a sponsor
 export async function deleteSponsorData(id: number): Promise<void> {
-  try {
-    const existingSponsors = await getSponsorData();
-    const filteredSponsors = existingSponsors.filter(s => s.id !== id);
-    
-    if (filteredSponsors.length === existingSponsors.length) {
-      throw new Error('Sponsor not found');
-    }
+  const col = await getCollection()
+  const res = await col.deleteOne({ id })
+  if (res.deletedCount === 0) throw new Error('Sponsor not found')
 
-    await saveSponsorData(filteredSponsors);
-  } catch (error) {
-    console.error('Error deleting sponsor:', error);
-    throw error;
-  }
-}
-
-// Export all sponsors data as Excel-compatible format
-export async function exportSponsorsToExcel(): Promise<any[]> {
-  try {
-    const sponsors = await getSponsorData();
-    return sponsors.map(sponsor => ({
-      'ID': sponsor.id,
-      'Name': sponsor.name,
-      'Logo': sponsor.logo,
-      'Tier': sponsor.tier,
-      'Website': sponsor.website,
-      'Description': sponsor.description,
-      'Contribution': sponsor.contribution,
-      'Since': sponsor.since,
-      'Category': sponsor.category,
-      'Contact Email': sponsor.contactEmail,
-      'Contact Person': sponsor.contactPerson,
-      'Amount': sponsor.amount,
-      'Type': sponsor.type
-    }));
-  } catch (error) {
-    console.error('Error exporting sponsors to Excel:', error);
-    throw error;
+  if (cache) {
+    cache.data = cache.data.filter(d => d.id !== id)
+    cache.timestamp = Date.now()
   }
 }
